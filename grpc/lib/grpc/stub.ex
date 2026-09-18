@@ -205,6 +205,8 @@ defmodule GRPC.Stub do
     * `:accepted_compressors` - tell servers accepted compressors, this can be used without `:compressor`
     * `:headers` - headers to attach to each request
     * `:lb_policy` - load-balancing policy (`:pick_first`, `:round_robin`)
+    * `:connections_per_endpoint` - physical HTTP/2 connections maintained for
+      each resolved endpoint (default: `1`)
     * `:name` - a stable identity for the connection; connecting again with
       the same name reuses the running connection
 

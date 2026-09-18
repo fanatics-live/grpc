@@ -97,6 +97,33 @@ defmodule GRPC.Integration.ServiceTest do
     end)
   end
 
+  test "pooled client stream stays on its selected connection" do
+    run_server(FeatureServer, fn port ->
+      name = {:stream_pool, make_ref()}
+
+      {:ok, channel} =
+        GRPC.Stub.connect("localhost:#{port}",
+          name: name,
+          connections_per_endpoint: 3
+        )
+
+      point1 = %Routeguide.Point{latitude: 400_000_000, longitude: -750_000_000}
+      point2 = %Routeguide.Point{latitude: 420_000_000, longitude: -730_000_000}
+
+      stream = Routeguide.RouteGuide.Stub.record_route(channel)
+      selected_pid = stream.channel.adapter_payload.conn_pid
+
+      stream = GRPC.Stub.send_request(stream, point1)
+      assert stream.channel.adapter_payload.conn_pid == selected_pid
+
+      stream = GRPC.Stub.send_request(stream, point2, end_stream: true)
+      assert stream.channel.adapter_payload.conn_pid == selected_pid
+
+      assert {:ok, %Routeguide.RouteSummary{point_count: 2}} = GRPC.Stub.recv(stream)
+      assert {:ok, _channel} = GRPC.Stub.disconnect(channel)
+    end)
+  end
+
   test "bidirectional streaming RPC works" do
     run_server(FeatureServer, fn port ->
       {:ok, channel} = GRPC.Stub.connect("localhost:#{port}")

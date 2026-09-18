@@ -16,6 +16,32 @@ defmodule GRPC.Client.ConnectionTest do
     end
   end
 
+  defmodule TwoEndpointResolver do
+    def resolve(_target) do
+      {:ok,
+       %{
+         addresses: [
+           %{address: "10.0.0.1", port: 50051},
+           %{address: "10.0.0.2", port: 50051}
+         ],
+         service_config: %{}
+       }}
+    end
+  end
+
+  defmodule DuplicateEndpointResolver do
+    def resolve(_target) do
+      {:ok,
+       %{
+         addresses: [
+           %{address: "10.0.0.1", port: 50051},
+           %{address: "10.0.0.1", port: 50051}
+         ],
+         service_config: %{}
+       }}
+    end
+  end
+
   defmodule NoPickResolver do
     def resolve(_target) do
       {:ok,
@@ -302,6 +328,171 @@ defmodule GRPC.Client.ConnectionTest do
     end
   end
 
+  describe "connections_per_endpoint" do
+    test "defaults to one connection", %{ref: ref, target: target} do
+      {:ok, channel} =
+        Connection.connect(target,
+          adapter: GRPC.Test.PooledClientAdapter,
+          adapter_opts: [test_pid: self()],
+          name: ref
+        )
+
+      assert_receive {:connected, "127.0.0.1", nil, pid}
+      refute_receive {:connected, _, _, _}
+
+      assert {:ok, %Channel{adapter_payload: %{conn_pid: ^pid}}} =
+               Connection.pick_channel(channel)
+
+      Connection.disconnect(channel)
+    end
+
+    test "opens and rotates across the configured connections", %{ref: ref, target: target} do
+      {:ok, channel} =
+        Connection.connect(target,
+          adapter: GRPC.Test.PooledClientAdapter,
+          adapter_opts: [test_pid: self()],
+          connections_per_endpoint: 3,
+          name: ref
+        )
+
+      members = receive_members(3)
+      assert members |> Enum.map(&elem(&1, 0)) |> Enum.sort() == [0, 1, 2]
+
+      picked_pids =
+        for _ <- 1..3, into: MapSet.new() do
+          assert {:ok, %Channel{adapter_payload: %{conn_pid: pid}}} =
+                   Connection.pick_channel(channel)
+
+          pid
+        end
+
+      assert picked_pids == members |> Enum.map(&elem(&1, 1)) |> MapSet.new()
+
+      Connection.disconnect(channel)
+    end
+
+    test "duplicate resolver addresses do not duplicate pool members", %{ref: ref} do
+      {:ok, channel} =
+        Connection.connect("test://pool",
+          adapter: GRPC.Test.PooledClientAdapter,
+          adapter_opts: [test_pid: self()],
+          connections_per_endpoint: 3,
+          resolver: DuplicateEndpointResolver,
+          name: ref
+        )
+
+      for slot <- 0..2 do
+        assert_receive {:connected, "10.0.0.1", ^slot, _pid}
+      end
+
+      refute_receive {:connected, _, _, _}
+      assert map_size(:sys.get_state(whereis_name(ref)).real_channels) == 3
+
+      Connection.disconnect(channel)
+    end
+
+    test "pick-first stays on one endpoint while rotating its members", %{ref: ref} do
+      {:ok, channel} =
+        Connection.connect("test://pool",
+          adapter: GRPC.Test.PooledClientAdapter,
+          adapter_opts: [test_pid: self()],
+          connections_per_endpoint: 3,
+          resolver: TwoEndpointResolver,
+          name: ref
+        )
+
+      for _ <- 1..6, do: assert_receive({:connected, _, _, _})
+
+      picks =
+        for _ <- 1..3 do
+          assert {:ok, %Channel{host: host, connection_slot: slot}} =
+                   Connection.pick_channel(channel)
+
+          {host, slot}
+        end
+
+      assert picks |> Enum.map(&elem(&1, 0)) |> Enum.uniq() == ["10.0.0.1"]
+      assert picks |> Enum.map(&elem(&1, 1)) |> Enum.sort() == [0, 1, 2]
+
+      Connection.disconnect(channel)
+    end
+
+    test "keeps endpoint balancing separate from member balancing", %{ref: ref} do
+      {:ok, channel} =
+        Connection.connect("test://pool",
+          adapter: GRPC.Test.PooledClientAdapter,
+          adapter_opts: [test_pid: self()],
+          connections_per_endpoint: 3,
+          lb_policy: :round_robin,
+          resolver: TwoEndpointResolver,
+          name: ref
+        )
+
+      for _ <- 1..6, do: assert_receive({:connected, _, _, _})
+
+      picks =
+        for _ <- 1..6 do
+          assert {:ok, %Channel{host: host, connection_slot: slot}} =
+                   Connection.pick_channel(channel)
+
+          {host, slot}
+        end
+
+      for host <- ["10.0.0.1", "10.0.0.2"] do
+        assert picks
+               |> Enum.filter(&(elem(&1, 0) == host))
+               |> Enum.map(&elem(&1, 1))
+               |> Enum.sort() == [0, 1, 2]
+      end
+
+      Connection.disconnect(channel)
+    end
+
+    test "removes one dead member without removing its siblings", %{ref: ref, target: target} do
+      {:ok, channel} =
+        Connection.connect(target,
+          adapter: GRPC.Test.PooledClientAdapter,
+          adapter_opts: [test_pid: self()],
+          connections_per_endpoint: 3,
+          name: ref
+        )
+
+      members = receive_members(3)
+      {dead_slot, dead_pid} = hd(members)
+      Process.exit(dead_pid, :kill)
+
+      connection_pid = whereis_name(ref)
+      assert_eventually(fn -> match?({:failed, _}, member_state(connection_pid, dead_slot)) end)
+
+      live_pids = members |> tl() |> Enum.map(&elem(&1, 1)) |> MapSet.new()
+
+      for _ <- 1..6 do
+        assert {:ok, %Channel{adapter_payload: %{conn_pid: pid}}} =
+                 Connection.pick_channel(channel)
+
+        assert MapSet.member?(live_pids, pid)
+      end
+
+      send(connection_pid, :repair_channels)
+      assert_receive {:connected, "127.0.0.1", ^dead_slot, replacement_pid}, 1_000
+      refute replacement_pid == dead_pid
+      assert map_size(:sys.get_state(connection_pid).real_channels) == 3
+
+      Connection.disconnect(channel)
+    end
+
+    test "rejects invalid connection counts", %{target: target} do
+      for count <- [0, -1, 1.5, true] do
+        assert_raise ArgumentError, ~r/connections_per_endpoint must be a positive integer/, fn ->
+          Connection.connect(target,
+            adapter: GRPC.Test.ClientAdapter,
+            connections_per_endpoint: count
+          )
+        end
+      end
+    end
+  end
+
   describe "connect/2 - fail-fast contract" do
     test "returns the dial error and tears the process down when the backend is unreachable", %{
       ref: ref
@@ -414,6 +605,29 @@ defmodule GRPC.Client.ConnectionTest do
 
       assert {:ok, ^expected} =
                @peer.call(peer2, Routeguide.RouteGuide.Stub, :get_feature, [channel2, point])
+    end
+  end
+
+  defp receive_members(count) do
+    for _ <- 1..count do
+      assert_receive {:connected, "127.0.0.1", slot, pid}
+      {slot, pid}
+    end
+  end
+
+  defp member_state(connection_pid, slot) do
+    :sys.get_state(connection_pid).real_channels[{"127.0.0.1:50051", slot}]
+  end
+
+  defp assert_eventually(fun, attempts \\ 50)
+  defp assert_eventually(fun, 0), do: assert(fun.())
+
+  defp assert_eventually(fun, attempts) do
+    if fun.() do
+      :ok
+    else
+      Process.sleep(10)
+      assert_eventually(fun, attempts - 1)
     end
   end
 

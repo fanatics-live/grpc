@@ -208,6 +208,36 @@ defmodule GRPC.Client.Adapters.MintTest do
   end
 
   describe "receive_data/2 - deadline through GRPC.Stub" do
+    test "a same-endpoint pool owns distinct Mint connections", %{port: port} do
+      name = {:mint_pool, make_ref()}
+
+      {:ok, channel} =
+        GRPC.Stub.connect("localhost:#{port}",
+          adapter: Mint,
+          connections_per_endpoint: 3,
+          name: name
+        )
+
+      on_exit(fn -> GRPC.Stub.disconnect(channel) end)
+
+      [{manager_pid, _}] =
+        Registry.lookup(GRPC.Client.Registry, {GRPC.Client.Connection, name})
+
+      connection_pids =
+        manager_pid
+        |> :sys.get_state()
+        |> Map.fetch!(:real_channels)
+        |> Map.values()
+        |> Enum.map(fn {:connected, ch} -> ch.adapter_payload.conn_pid end)
+
+      assert length(Enum.uniq(connection_pids)) == 3
+
+      point = %Routeguide.Point{latitude: 409_146_138, longitude: -746_188_906}
+
+      assert {:ok, %Routeguide.Feature{location: ^point}} =
+               Routeguide.RouteGuide.Stub.get_feature(channel, point)
+    end
+
     test "a :deadline on a unary call reaches the server instead of raising", %{port: port} do
       {:ok, channel} = GRPC.Stub.connect("localhost:#{port}", adapter: Mint)
       on_exit(fn -> GRPC.Stub.disconnect(channel) end)

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Enhancements
+
+  * Client connections can maintain multiple physical HTTP/2 connections per resolved endpoint with the opt-in `:connections_per_endpoint` option. RPCs retain the configured endpoint load-balancing policy, then round-robin across healthy same-endpoint connections. The default remains one connection.
+
 ### Behavior Changes
 
   * The Mint adapter now enforces the requested `:timeout`/`:deadline` on unary receives. A unary call that never receives a response fails with `DEADLINE_EXCEEDED` after the documented 10s default instead of blocking indefinitely, and an explicit `:deadline` now takes precedence over `:timeout`.

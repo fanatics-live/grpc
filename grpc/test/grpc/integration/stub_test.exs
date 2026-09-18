@@ -140,6 +140,51 @@ defmodule GRPC.Integration.StubTest do
     end)
   end
 
+  test "named Gun connections can maintain a same-endpoint pool" do
+    run_server(HelloServer, fn port ->
+      channel_name = {:named_gun_pool, make_ref()}
+
+      {:ok, channel} =
+        GRPC.Stub.connect("localhost:#{port}",
+          name: channel_name,
+          connections_per_endpoint: 3
+        )
+
+      manager_pid = whereis_name(channel_name)
+
+      connection_pids =
+        manager_pid
+        |> :sys.get_state()
+        |> Map.fetch!(:real_channels)
+        |> Map.values()
+        |> Enum.map(fn {:connected, ch} -> ch.adapter_payload.conn_pid end)
+
+      assert length(Enum.uniq(connection_pids)) == 3
+
+      gun_pids =
+        Enum.map(connection_pids, fn pid ->
+          %{gun_pid: gun_pid} = :sys.get_state(pid)
+          gun_pid
+        end)
+
+      assert length(Enum.uniq(gun_pids)) == 3
+
+      picked_pids =
+        for _ <- 1..3, into: MapSet.new() do
+          assert {:ok, picked_channel} = GRPC.Client.Connection.pick_channel(channel)
+          picked_channel.adapter_payload.conn_pid
+        end
+
+      assert picked_pids == MapSet.new(connection_pids)
+
+      request = %Helloworld.HelloRequest{name: "pooled caller"}
+      assert {:ok, reply} = Helloworld.Greeter.Stub.say_hello(channel, request)
+      assert reply.message == "Hello, pooled caller"
+
+      assert {:ok, _channel} = GRPC.Stub.disconnect(channel)
+    end)
+  end
+
   test "returns error when timeout" do
     run_server(SlowServer, fn port ->
       {:ok, channel} = GRPC.Stub.connect("localhost:#{port}")

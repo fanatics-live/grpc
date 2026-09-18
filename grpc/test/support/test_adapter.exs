@@ -11,6 +11,36 @@ defmodule GRPC.Test.ClientAdapter do
   def cancel(stream), do: stream
 end
 
+defmodule GRPC.Test.PooledClientAdapter do
+  @behaviour GRPC.Client.Adapter
+
+  def connect(channel, opts) do
+    test_pid = Keyword.fetch!(opts, :test_pid)
+    pid = spawn(fn -> loop() end)
+    send(test_pid, {:connected, channel.host, channel.connection_slot, pid})
+    {:ok, %{channel | adapter_payload: %{conn_pid: pid}}}
+  end
+
+  def disconnect(%{adapter_payload: %{conn_pid: pid}} = channel) do
+    send(pid, :stop)
+    {:ok, %{channel | adapter_payload: %{conn_pid: nil}}}
+  end
+
+  def send_request(stream, _message, _opts), do: stream
+  def receive_data(_stream, _opts), do: {:ok, nil}
+  def send_data(stream, _message, _opts), do: stream
+  def send_headers(stream, _opts), do: stream
+  def end_stream(stream), do: stream
+  def cancel(stream), do: stream
+
+  defp loop do
+    receive do
+      :stop -> :ok
+      _ -> loop()
+    end
+  end
+end
+
 defmodule GRPC.Test.FailingClientAdapter do
   @moduledoc """
   A test adapter that refuses to connect to selected hosts. All other hosts

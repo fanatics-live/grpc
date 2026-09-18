@@ -178,6 +178,7 @@ defmodule GRPC.Client.Connection do
             real_channels: %{},
             lb_mod: nil,
             lb_state: nil,
+            member_balancers: %{},
             resolver: nil,
             adapter: GRPC.Client.Adapters.Gun,
             resolver_target: nil,
@@ -256,6 +257,8 @@ defmodule GRPC.Client.Connection do
 
     * `:adapter` – transport adapter module (default: `GRPC.Client.Adapters.Gun`)
     * `:adapter_opts` – options passed to the adapter
+    * `:connections_per_endpoint` – physical HTTP/2 connections maintained for
+      each resolved endpoint (default: `1`)
     * `:resolver` – resolver module (default: `GRPC.Client.Resolver`)
     * `:lb_policy` – load-balancing policy (`:pick_first`, `:round_robin`)
     * `:interceptors` – list of client interceptors
@@ -451,7 +454,7 @@ defmodule GRPC.Client.Connection do
     case :persistent_term.get(lb_key(ref), nil) do
       {lb_mod, lb_state} when not is_nil(lb_mod) ->
         case lb_mod.pick(lb_state) do
-          {:ok, %Channel{} = channel, _new_state} -> {:ok, channel}
+          {:ok, %Channel{} = channel, _new_state} -> pick_connection_member(channel)
           {:error, _} -> {:error, :no_connection}
         end
 
@@ -459,6 +462,15 @@ defmodule GRPC.Client.Connection do
         {:error, :no_connection}
     end
   end
+
+  defp pick_connection_member(%Channel{connection_pool: pool}) when not is_nil(pool) do
+    case GRPC.Client.LoadBalancing.RoundRobin.pick(pool) do
+      {:ok, %Channel{} = channel, _new_state} -> {:ok, channel}
+      {:error, _} -> {:error, :no_connection}
+    end
+  end
+
+  defp pick_connection_member(%Channel{} = channel), do: {:ok, channel}
 
   @doc """
   Triggers an immediate DNS re-resolution, subject to rate limiting.
@@ -679,7 +691,7 @@ defmodule GRPC.Client.Connection do
     flush_sibling_death_signal(pid)
 
     Logger.warning(
-      "gRPC connection #{key} for #{state.resolver_target} went down: #{inspect(reason)}"
+      "gRPC connection #{inspect(key)} for #{state.resolver_target} went down: #{inspect(reason)}"
     )
 
     real_channels = Map.put(state.real_channels, key, {:failed, reason})
@@ -937,9 +949,18 @@ defmodule GRPC.Client.Connection do
           end
       end
 
+    addresses = unique_addresses(addresses)
     real_channels = build_real_channels(addresses, state.virtual_channel, norm_opts, adapter)
 
-    case init_or_update_lb(lb_mod, real_channels, adapter, state) do
+    {member_balancers, endpoint_channels} =
+      sync_member_balancers(
+        real_channels,
+        addresses,
+        state.member_balancers,
+        norm_opts[:connections_per_endpoint]
+      )
+
+    case init_or_update_lb(lb_mod, endpoint_channels, real_channels, adapter, state) do
       {:ok, lb_state} ->
         resolver_state = maybe_init_resolver(state)
         :persistent_term.put(lb_key(state.virtual_channel.ref), {lb_mod, lb_state})
@@ -949,12 +970,14 @@ defmodule GRPC.Client.Connection do
            state
            | real_channels: real_channels,
              desired_addresses: addresses,
+             member_balancers: member_balancers,
              lb_mod: lb_mod,
              lb_state: lb_state,
              resolver_state: resolver_state
          }}
 
       {:error, reason} ->
+        terminate_member_balancers(member_balancers)
         {:error, reason}
     end
   end
@@ -965,16 +988,17 @@ defmodule GRPC.Client.Connection do
   # don't leak one table per cycle.
   defp init_or_update_lb(
          lb_mod,
+         endpoint_channels,
          real_channels,
          adapter,
          %__MODULE__{lb_mod: lb_mod, lb_state: lb_state}
        )
        when not is_nil(lb_state) do
-    run_lb(real_channels, adapter, &lb_mod.update(lb_state, &1))
+    run_lb(endpoint_channels, real_channels, adapter, &lb_mod.update(lb_state, &1))
   end
 
-  defp init_or_update_lb(lb_mod, real_channels, adapter, state) do
-    case init_lb(lb_mod, real_channels, adapter) do
+  defp init_or_update_lb(lb_mod, endpoint_channels, real_channels, adapter, state) do
+    case init_lb(lb_mod, endpoint_channels, real_channels, adapter) do
       {:ok, lb_state} ->
         # A policy flip discards the previous LB; drop its ETS-backed state so
         # repeated re-establishments can't leak one table per flip. Terminate
@@ -998,12 +1022,12 @@ defmodule GRPC.Client.Connection do
     :ok
   end
 
-  defp init_lb(lb_mod, real_channels, adapter) do
-    run_lb(real_channels, adapter, &lb_mod.init(channels: &1))
+  defp init_lb(lb_mod, endpoint_channels, real_channels, adapter) do
+    run_lb(endpoint_channels, real_channels, adapter, &lb_mod.init(channels: &1))
   end
 
-  defp run_lb(real_channels, adapter, lb_call) do
-    case connected_channels(real_channels) do
+  defp run_lb(endpoint_channels, real_channels, adapter, lb_call) do
+    case endpoint_channels do
       [] ->
         disconnect_real_channels(real_channels, adapter)
         {:error, first_failure(real_channels) || :no_addresses}
@@ -1119,6 +1143,7 @@ defmodule GRPC.Client.Connection do
   defp handle_resolve_result({:ok, %{addresses: []}}, state), do: state
 
   defp handle_resolve_result({:ok, %{addresses: new_addresses}}, state) do
+    new_addresses = unique_addresses(new_addresses)
     state = %{state | desired_addresses: new_addresses}
     reconcile_channels(new_addresses, state.adapter, state.connect_opts, state)
   end
@@ -1126,7 +1151,7 @@ defmodule GRPC.Client.Connection do
   defp handle_resolve_result({:error, _reason}, state), do: state
 
   defp reconcile_channels(new_addresses, adapter, opts, state) do
-    new_keys = MapSet.new(new_addresses, &build_address_key(&1.address, &1.port))
+    new_keys = desired_channel_keys(new_addresses, opts[:connections_per_endpoint])
     old_keys = MapSet.new(Map.keys(state.real_channels))
 
     added = MapSet.difference(new_keys, old_keys)
@@ -1153,32 +1178,40 @@ defmodule GRPC.Client.Connection do
 
   defp connect_new_channels(new_addresses, added, adapter, opts, state, real_channels) do
     Enum.reduce(new_addresses, real_channels, fn %{address: host, port: port}, channels ->
-      key = build_address_key(host, port)
-      existing = Map.get(channels, key)
+      Enum.reduce(pool_slots(opts[:connections_per_endpoint]), channels, fn slot, channels ->
+        key = build_channel_key(host, port, slot)
+        existing = Map.get(channels, key)
 
-      should_connect =
-        MapSet.member?(added, key) or
-          match?({:failed, _}, existing) or
-          not channel_alive?(existing)
+        should_connect =
+          MapSet.member?(added, key) or
+            match?({:failed, _}, existing) or
+            not channel_alive?(existing)
 
-      if should_connect do
-        case existing do
-          {:connected, ch} -> do_disconnect(adapter, ch)
-          _ -> :ok
+        if should_connect do
+          case existing do
+            {:connected, ch} -> do_disconnect(adapter, ch)
+            _ -> :ok
+          end
+
+          case connect_real_channel(state.virtual_channel, host, port, slot, opts, adapter) do
+            {:ok, ch} -> Map.put(channels, key, {:connected, ch})
+            {:error, reason} -> Map.put(channels, key, {:failed, reason})
+          end
+        else
+          channels
         end
-
-        case connect_real_channel(state.virtual_channel, host, port, opts, adapter) do
-          {:ok, ch} -> Map.put(channels, key, {:connected, ch})
-          {:error, reason} -> Map.put(channels, key, {:failed, reason})
-        end
-      else
-        channels
-      end
+      end)
     end)
   end
 
   defp rebalance_after_reconcile(real_channels, state) do
-    connected = connected_channels(real_channels)
+    {member_balancers, connected} =
+      sync_member_balancers(
+        real_channels,
+        state.desired_addresses,
+        state.member_balancers,
+        state.connect_opts[:connections_per_endpoint]
+      )
 
     new_lb_state =
       if state.lb_mod do
@@ -1201,7 +1234,12 @@ defmodule GRPC.Client.Connection do
       :persistent_term.put(lb_key(state.virtual_channel.ref), {state.lb_mod, new_lb_state})
     end
 
-    state = %{state | real_channels: real_channels, lb_state: new_lb_state}
+    state = %{
+      state
+      | real_channels: real_channels,
+        member_balancers: member_balancers,
+        lb_state: new_lb_state
+    }
 
     # A resolver update can reconnect channels while a delayed retry is still
     # pending; adopt immediately so await_ready and connect/2 track actual
@@ -1264,6 +1302,7 @@ defmodule GRPC.Client.Connection do
         name: make_ref(),
         adapter: GRPC.Client.Adapters.Gun,
         adapter_opts: [],
+        connections_per_endpoint: 1,
         interceptors: [],
         codec: GRPC.Codec.Proto,
         compressor: nil,
@@ -1282,6 +1321,7 @@ defmodule GRPC.Client.Connection do
     adapter = Keyword.get(opts, :adapter, GRPC.Client.Adapters.Gun)
 
     validate_adapter_opts!(opts[:adapter_opts])
+    validate_connections_per_endpoint!(opts[:connections_per_endpoint])
 
     {norm_target, norm_opts, scheme} = normalize_target_and_opts(target, opts)
     cred = resolve_credential(norm_opts[:cred], scheme)
@@ -1323,6 +1363,13 @@ defmodule GRPC.Client.Connection do
   defp validate_adapter_opts!(_),
     do: raise(ArgumentError, ":adapter_opts must be a keyword list if present")
 
+  defp validate_connections_per_endpoint!(count) when is_integer(count) and count > 0, do: :ok
+
+  defp validate_connections_per_endpoint!(count) do
+    raise ArgumentError,
+          ":connections_per_endpoint must be a positive integer, got: #{inspect(count)}"
+  end
+
   defp build_compressor_list(compressor, accepted) when is_list(accepted) do
     [compressor | accepted]
     |> Enum.reject(&is_nil/1)
@@ -1346,16 +1393,35 @@ defmodule GRPC.Client.Connection do
   end
 
   defp build_real_channels(addresses, %Channel{} = virtual_channel, norm_opts, adapter) do
-    Map.new(addresses, fn %{port: port, address: host} ->
-      case connect_real_channel(virtual_channel, host, port, norm_opts, adapter) do
-        {:ok, ch} ->
-          {build_address_key(host, port), {:connected, ch}}
+    Map.new(
+      for %{port: port, address: host} <- addresses,
+          slot <- pool_slots(norm_opts[:connections_per_endpoint]) do
+        result = connect_real_channel(virtual_channel, host, port, slot, norm_opts, adapter)
 
-        {:error, reason} ->
-          {build_address_key(host, port), {:failed, reason}}
+        entry =
+          case result do
+            {:ok, ch} -> {:connected, ch}
+            {:error, reason} -> {:failed, reason}
+          end
+
+        {build_channel_key(host, port, slot), entry}
       end
-    end)
+    )
   end
+
+  defp pool_slots(1), do: [nil]
+  defp pool_slots(count), do: 0..(count - 1)
+
+  defp desired_channel_keys(addresses, pool_size) do
+    MapSet.new(
+      for %{port: port, address: host} <- addresses,
+          slot <- pool_slots(pool_size),
+          do: build_channel_key(host, port, slot)
+    )
+  end
+
+  defp build_channel_key(host, port, nil), do: build_address_key(host, port)
+  defp build_channel_key(host, port, slot), do: {build_address_key(host, port), slot}
 
   defp build_address_key(host, port) do
     case host do
@@ -1402,9 +1468,72 @@ defmodule GRPC.Client.Connection do
   defp choose_lb(:round_robin), do: GRPC.Client.LoadBalancing.RoundRobin
   defp choose_lb(_), do: GRPC.Client.LoadBalancing.PickFirst
 
-  defp connect_real_channel(%Channel{} = vc, host, port, opts, adapter) do
+  defp unique_addresses(addresses) do
+    Enum.uniq_by(addresses, &build_address_key(&1.address, &1.port))
+  end
+
+  defp sync_member_balancers(real_channels, addresses, member_balancers, 1) do
+    terminate_member_balancers(member_balancers)
+
+    channels =
+      for %{address: host, port: port} <- addresses,
+          {:connected, channel} <- [Map.get(real_channels, build_address_key(host, port))],
+          do: channel
+
+    {%{}, channels}
+  end
+
+  defp sync_member_balancers(real_channels, addresses, member_balancers, _pool_size) do
+    desired_keys = MapSet.new(addresses, &build_address_key(&1.address, &1.port))
+
+    {kept, removed} =
+      Map.split(member_balancers, MapSet.to_list(desired_keys))
+
+    terminate_member_balancers(removed)
+
+    Enum.reduce(addresses, {kept, []}, fn %{address: host, port: port}, {balancers, channels} ->
+      key = build_address_key(host, port)
+      members = connected_members(real_channels, host, port)
+
+      case {Map.get(balancers, key), members} do
+        {nil, []} ->
+          {balancers, channels}
+
+        {nil, members} ->
+          {:ok, balancer} = GRPC.Client.LoadBalancing.RoundRobin.init(channels: members)
+          representative = %Channel{hd(members) | connection_pool: balancer}
+          {Map.put(balancers, key, balancer), channels ++ [representative]}
+
+        {balancer, members} ->
+          {:ok, balancer} = GRPC.Client.LoadBalancing.RoundRobin.update(balancer, members)
+          balancers = Map.put(balancers, key, balancer)
+
+          case members do
+            [] -> {balancers, channels}
+            [first | _] -> {balancers, channels ++ [%Channel{first | connection_pool: balancer}]}
+          end
+      end
+    end)
+  end
+
+  defp connected_members(real_channels, host, port) do
+    real_channels
+    |> Enum.flat_map(fn
+      {_key, {:connected, %Channel{host: ^host, port: ^port} = channel}} -> [channel]
+      _ -> []
+    end)
+    |> Enum.sort_by(& &1.connection_slot)
+  end
+
+  defp terminate_member_balancers(member_balancers) do
+    Enum.each(member_balancers, fn {_key, balancer} ->
+      GRPC.Client.LoadBalancing.RoundRobin.terminate(balancer)
+    end)
+  end
+
+  defp connect_real_channel(%Channel{} = vc, host, port, slot, opts, adapter) do
     result =
-      %Channel{vc | host: host, port: port}
+      %Channel{vc | host: host, port: port, connection_slot: slot}
       |> adapter.connect(opts[:adapter_opts])
 
     with {:ok, %Channel{adapter_payload: %{conn_pid: pid}}} when is_pid(pid) <- result do

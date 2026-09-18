@@ -15,7 +15,8 @@ defmodule GRPC.Client.Adapters.Gun.ConnectionProcess do
   bookkeeping.
 
   Named channels are registered in the node-local `GRPC.Client.Registry` under
-  `{ref, host, port}`, so a connection is reused by every caller on the node.
+  `{ref, host, port}`. Pooled members append their physical slot to that key,
+  so each slot is reused by callers without collapsing the pool to one process.
   """
 
   use GenServer
@@ -230,5 +231,9 @@ defmodule GRPC.Client.Adapters.Gun.ConnectionProcess do
     end
   end
 
-  defp owner_key(%{ref: ref, host: host, port: port}), do: {ref, host, port}
+  defp owner_key(%{ref: ref, host: host, port: port, connection_slot: nil}),
+    do: {ref, host, port}
+
+  defp owner_key(%{ref: ref, host: host, port: port, connection_slot: slot}),
+    do: {ref, host, port, slot}
 end

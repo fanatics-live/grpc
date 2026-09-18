@@ -42,6 +42,33 @@ iex> {:ok, channel} = GRPC.Stub.connect("unix:/tmp/my.sock")
 
 ---
 
+## Multiple connections per endpoint
+
+HTTP/2 multiplexes many RPC streams over one connection, so one connection per
+resolved endpoint remains the default. Workloads that need additional
+connection-level stream capacity can opt into a fixed same-endpoint connection
+pool:
+
+```elixir
+{:ok, channel} =
+  GRPC.Stub.connect("dns://orders.prod.svc.cluster.local:50051",
+    connections_per_endpoint: 5
+  )
+```
+
+Endpoint load balancing and connection pooling are separate. `:pick_first`
+continues to select one resolved endpoint, while `:round_robin` continues to
+rotate across resolved endpoints. Within the selected endpoint, each RPC is
+round-robined across its healthy physical connections. Streaming RPCs stay on
+the connection selected when the call starts.
+
+The option must be a positive integer and defaults to `1`. Each additional
+connection consumes another socket, transport process, TLS session, and
+server-side connection, so configure it from measured capacity needs rather
+than enabling a large pool by default.
+
+---
+
 ## Performance characteristics
 
 Round-robin balancing makes a real routing decision on every RPC, so each pick

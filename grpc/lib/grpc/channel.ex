@@ -14,6 +14,8 @@ defmodule GRPC.Channel do
     * `:adapter` - a client adapter module, like `GRPC.Client.Adapters.Gun`
     * `:codec` - a default codec for this channel
     * `:adapter_payload` - payload the adapter uses
+    * `:connection_slot` - internal physical-connection identity
+    * `:connection_pool` - internal same-endpoint connection selector
   """
 
   defstruct host: nil,
@@ -23,6 +25,8 @@ defmodule GRPC.Channel do
             ref: nil,
             adapter: nil,
             adapter_payload: nil,
+            connection_slot: nil,
+            connection_pool: nil,
             codec: GRPC.Codec.Proto,
             interceptors: [],
             compressor: nil,
